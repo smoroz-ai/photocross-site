@@ -19,6 +19,7 @@ def get_db():
     return conn
 
 
+# Функция создания базы данных
 def init_db():
     with get_db() as conn:
         conn.execute("""
@@ -32,8 +33,11 @@ def init_db():
         """)
 
 
+# ВАЖНО: Вызываем создание базы сразу при старте!
+init_db()
+
+
 def upload_to_yadisk(file_obj, filename):
-    """Загружает файл на Яндекс.Диск. Возвращает путь на Диске или None."""
     if not YADISK_TOKEN:
         return None
 
@@ -130,6 +134,5 @@ def export():
 
 
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
