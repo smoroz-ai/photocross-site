@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import sqlite3
 from datetime import datetime
@@ -19,9 +20,9 @@ def get_db():
     return conn
 
 
-# Функция создания базы данных
 def init_db():
     with get_db() as conn:
+        # Таблица для фото
         conn.execute("""
             CREATE TABLE IF NOT EXISTS photos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,22 +32,76 @@ def init_db():
                 uploaded_at TEXT NOT NULL
             )
         """)
+        # Новая таблица для команд (чтобы присваивать им номера)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS teams (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL
+            )
+        """)
 
 
-# ВАЖНО: Вызываем создание базы сразу при старте!
 init_db()
 
 
-def upload_to_yadisk(file_obj, filename):
+def sanitize_name(name):
+    """Очищает название команды от запрещенных символов для файловой системы"""
+    clean = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\-_]', '', name)
+    clean = " ".join(clean.split())
+    return clean.replace(" ", "_")[:50]
+
+
+def get_team_id(team_name):
+    """Возвращает номер команды. Если команды нет в базе, создает её и выдает новый номер."""
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM teams WHERE name = ?", (team_name,)).fetchone()
+        if row:
+            return row["id"]
+        
+        # Если команды нет — добавляем
+        cur = conn.execute("INSERT INTO teams (name) VALUES (?)", (team_name,))
+        return cur.lastrowid
+
+
+def upload_to_yadisk(file_obj, team_name, task_num):
     if not YADISK_TOKEN:
         return None
 
-    path = f"{YADISK_FOLDER}/{filename}"
+    # Получаем номер команды (01, 02, 03...)
+    team_id = get_team_id(team_name)
+    formatted_team = f"{team_id:02d}"
 
+    safe_team = sanitize_name(team_name)
+    if not safe_team:
+        safe_team = "Team_" + uuid.uuid4().hex[:6]
+
+    # Папка всё еще называется по имени, чтобы людям было понятно
+    folder_path = f"{YADISK_FOLDER}/{safe_team}"
+    
+    ext = os.path.splitext(file_obj.filename)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".heic", ".webp"):
+        ext = ".jpg"
+    
+    # Форматируем номер задания (01, 02...)
+    formatted_task = f"{task_num:02d}"
+    
+    # Имя файла: "0101_Фотоны_удачи.jpg" (Номер команды + номер задания)
+    filename = f"{formatted_team}{formatted_task}_{safe_team}{ext}"
+    file_path = f"{folder_path}/{filename}"
+
+    # Создаем папку команды (если её нет)
+    requests.put(
+        "https://cloud-api.yandex.net/v1/disk/resources",
+        headers={"Authorization": f"OAuth {YADISK_TOKEN}"},
+        params={"path": folder_path},
+        timeout=30,
+    )
+
+    # Получаем ссылку для загрузки файла (overwrite=true перезапишет старый файл)
     resp = requests.get(
         "https://cloud-api.yandex.net/v1/disk/resources/upload",
         headers={"Authorization": f"OAuth {YADISK_TOKEN}"},
-        params={"path": path, "overwrite": "true"},
+        params={"path": file_path, "overwrite": "true"},
         timeout=30,
     )
     if resp.status_code != 200:
@@ -57,12 +112,13 @@ def upload_to_yadisk(file_obj, filename):
     if not upload_url:
         return None
 
+    # Отправляем файл на Диск
     put_resp = requests.put(upload_url, data=file_obj, timeout=120)
     if put_resp.status_code not in (200, 201, 202):
         app.logger.error(f"Yandex upload failed: {put_resp.status_code}")
         return None
 
-    return path
+    return file_path
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -88,20 +144,17 @@ def index():
             flash("Выберите фото", "error")
             return redirect(url_for("index"))
 
-        ext = os.path.splitext(photo.filename)[1].lower()
-        if ext not in (".jpg", ".jpeg", ".png", ".heic", ".webp"):
-            ext = ".jpg"
-
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        safe_team = "".join(c for c in team if c.isalnum() or c in " _-")[:40].replace(" ", "_")
-        filename = f"{safe_team}_zad{task_num}_{timestamp}_{uuid.uuid4().hex[:6]}{ext}"
-
-        yadisk_path = upload_to_yadisk(photo, filename)
+        yadisk_path = upload_to_yadisk(photo, team, task_num)
         if not yadisk_path:
-            flash("Не удалось загрузить фото на Яндекс.Диск. Попробуйте ещё раз.", "error")
+            flash("Не удалось загрузить фото на Яндекс.Диск. Проверьте токен или попробуйте ещё раз.", "error")
             return redirect(url_for("index"))
 
         with get_db() as conn:
+            # Удаляем старую запись для этого же задания этой же команды, чтобы в базе не было дублей
+            conn.execute(
+                "DELETE FROM photos WHERE team = ? AND task_num = ?",
+                (team, task_num)
+            )
             conn.execute(
                 "INSERT INTO photos (team, task_num, yadisk_path, uploaded_at) VALUES (?, ?, ?, ?)",
                 (team, task_num, yadisk_path, datetime.utcnow().isoformat()),
